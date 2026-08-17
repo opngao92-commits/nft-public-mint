@@ -6,21 +6,22 @@ import chalk from "chalk";
 
 dotenv.config({ path: path.resolve(process.cwd(), ".env") });
 
-import { runWizard } from "./wizard";
+import { runSafeWizard } from "./safe-wizard";
 import { closePrompts } from "./prompt";
 
 const HELP = `
-NFT Public Mint Sniper
+NFT Public Mint SAFE v1
 
-  Mints public SeaDrop stages. Calldata is built from on-chain state, so no
-  OpenSea account or access token is required.
+  Public SeaDrop mintPublic() only.
+  Uses direct NFT contract input and fail-closed safety checks.
 
 Usage
-  npm start              run the interactive wizard
+  npm start              real mint wizard
+  npm run dry-run        public-address-only preflight; no private key/sign/send
   npm start -- --help    show this message
 
-Everything is asked interactively: keys, chain, quantity, NFT link, RPC,
-gas and timing. Optional defaults can be set in .env (see .env.example).
+Optional defaults can be set in .env (see .env.example).
+Never store private keys or seed phrases in .env.
 `;
 
 async function main(): Promise<void> {
@@ -31,7 +32,7 @@ async function main(): Promise<void> {
   }
 
   try {
-    await runWizard();
+    await runSafeWizard();
     closePrompts();
     process.exit(0);
   } catch (err: any) {
