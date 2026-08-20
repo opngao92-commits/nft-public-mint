@@ -7,8 +7,10 @@ dist/
 .env.*
 !.env.example
 
-# Public dry-run wallet list — local only
+# Local wallet files — never commit
 wallets.txt
+wallets.secure
+*.secure
 
 # Private keys — never commit
 wallets/
