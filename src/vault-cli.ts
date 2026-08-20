@@ -1,3 +1,5 @@
+import path from "path";
+import dotenv from "dotenv";
 import chalk from "chalk";
 import { Wallet } from "ethers";
 import { askHidden, askYesNo, closePrompts } from "./prompt";
@@ -8,6 +10,8 @@ import {
   walletVaultExists,
   walletVaultFile,
 } from "./wallet-vault";
+
+dotenv.config({ path: path.resolve(process.cwd(), ".env") });
 
 async function main(): Promise<void> {
   const action = (process.argv[2] || "setup").toLowerCase();
