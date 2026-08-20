@@ -1,3 +1,4 @@
+import fs from "fs";
 import chalk from "chalk";
 import { JsonRpcProvider, Wallet, formatEther, getAddress, isAddress } from "ethers";
 import { CHAINS, resolveChain } from "./chains";
@@ -60,13 +61,15 @@ export async function runSafeWizard(): Promise<void> {
   console.log(chalk.bold.white("\nGas"));
   console.log(chalk.gray(`  Current network fee reference: ${baseFee.toFixed(6)} gwei`));
 
-  const envMax = Number(process.env.MAX_FEE_PER_GAS || (chainKey === "ethereum" ? 80 : 2));
-  const envTip = Number(process.env.MAX_PRIORITY_FEE || (chainKey === "ethereum" ? 5 : 0.05));
+  const chainDefaultMax = chainKey === "ethereum" ? 80 : chainKey === "robinhood" ? 0.1 : 2;
+  const chainDefaultTip = chainKey === "ethereum" ? 5 : 0.05;
+  const envMax = Number(process.env.MAX_FEE_PER_GAS || chainDefaultMax);
+  const envTip = Number(process.env.MAX_PRIORITY_FEE || chainDefaultTip);
   const suggestedMax = Math.max(envMax, Math.ceil((baseFee * 2 + envTip) * 1000) / 1000);
-  const maxFeeGwei = await askNumber("Max fee per gas (gwei)", suggestedMax, { min: baseFee });
-  const tipGwei = await askNumber("Priority fee / tip (gwei)", Math.min(envTip, maxFeeGwei), { min: 0, max: maxFeeGwei });
-  const maxFeePerGas = gweiToWei(maxFeeGwei);
-  const maxPriorityFee = gweiToWei(tipGwei);
+  let maxFeeGwei = await askNumber("Max fee per gas (gwei)", suggestedMax, { min: baseFee });
+  let tipGwei = await askNumber("Priority fee / tip (gwei)", Math.min(envTip, maxFeeGwei), { min: 0, max: maxFeeGwei });
+  let maxFeePerGas = gweiToWei(maxFeeGwei);
+  let maxPriorityFee = gweiToWei(tipGwei);
   const gasLimit = parseInt(process.env.GAS_LIMIT || "250000", 10) || 250_000;
 
   const targetStart = await promptTiming(mintPlan.drop.startTime, mintPlan.drop.endTime);
@@ -85,11 +88,35 @@ export async function runSafeWizard(): Promise<void> {
   }
   assertAggregateSupply(states, quantity, addresses.length);
 
-  const required = BigInt(gasLimit) * maxFeePerGas + mintPlan.value;
   for (let i = 0; i < addresses.length; i++) {
     const bal = balances[i] as bigint;
     console.log(chalk.gray(`  [W${i}] ${addresses[i]}  balance ${formatEther(bal)}  minted ${states[i].minted}/${mintPlan.drop.maxTotalMintableByWallet}`));
-    if (bal < required) throw new Error(`[W${i}] is underfunded. Needs at least ${formatEther(required)} ${chain.nativeSymbol} at the selected max-fee ceiling.`);
+  }
+
+  let required = BigInt(gasLimit) * maxFeePerGas + mintPlan.value;
+  for (;;) {
+    const underfunded = addresses
+      .map((address, i) => ({ address, i, balance: balances[i] as bigint }))
+      .filter((x) => x.balance < required);
+
+    if (underfunded.length === 0) break;
+
+    console.log(chalk.bold.red(`\n  ${underfunded.length} wallet(s) are below the current worst-case reserve of ${formatEther(required)} ${chain.nativeSymbol}.`));
+    for (const x of underfunded) {
+      console.log(chalk.red(`  ✗ [W${x.i}] ${x.address}: ${formatEther(x.balance)} ${chain.nativeSymbol}`));
+    }
+
+    if (!(await askYesNo("Adjust gas ceiling and recheck the same wallet list?", true))) {
+      throw new Error("At least one wallet is underfunded at the selected max-fee ceiling.");
+    }
+
+    const retrySuggested = Math.max(baseFee, Math.ceil((baseFee * 2 + Math.min(tipGwei, maxFeeGwei)) * 1000) / 1000);
+    maxFeeGwei = await askNumber("Max fee per gas (gwei)", Math.min(maxFeeGwei, Math.max(retrySuggested, baseFee)), { min: baseFee });
+    tipGwei = await askNumber("Priority fee / tip (gwei)", Math.min(tipGwei, maxFeeGwei), { min: 0, max: maxFeeGwei });
+    maxFeePerGas = gweiToWei(maxFeeGwei);
+    maxPriorityFee = gweiToWei(tipGwei);
+    required = BigInt(gasLimit) * maxFeePerGas + mintPlan.value;
+    console.log(chalk.gray(`  → Rechecking without re-entering wallets. New worst-case reserve: ${formatEther(required)} ${chain.nativeSymbol} per wallet.`));
   }
 
   console.log(chalk.bold.white("\n──────── SAFE READY ────────"));
@@ -162,6 +189,17 @@ async function promptKeys(): Promise<string[]> {
 async function promptAddresses(): Promise<string[]> {
   console.log(chalk.bold.white("Public wallet addresses (dry-run)"));
   console.log(chalk.gray("  PUBLIC 0x addresses only — never paste a private key here."));
+
+  const walletFile = publicWalletFile();
+  if (fs.existsSync(walletFile)) {
+    const saved = readPublicWalletFile(walletFile);
+    console.log(chalk.green(`  ✓ Loaded ${saved.length} wallet(s) from ${walletFile}.`));
+    saved.forEach((addr, i) => console.log(chalk.gray(`  [W${i}] ${addr}`)));
+    console.log(chalk.gray(`  Edit/delete ${walletFile} if you want to change the dry-run wallet set.`));
+    return saved;
+  }
+
+  console.log(chalk.gray(`  No ${walletFile} yet. Enter addresses once; SAFE will save them for future dry-runs.`));
   const out: string[] = [];
   const seen = new Set<string>();
   for (;;) {
@@ -176,6 +214,36 @@ async function promptAddresses(): Promise<string[]> {
     if (seen.has(k)) { console.log(chalk.yellow("  ⚠ Duplicate skipped.")); continue; }
     seen.add(k); out.push(addr); console.log(chalk.green(`  ✓ [W${out.length - 1}] ${addr}`));
   }
+
+  fs.writeFileSync(walletFile, `${out.join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
+  console.log(chalk.green(`  ✓ Saved ${out.length} public wallet(s) to ${walletFile}.`));
+  return out;
+}
+
+function publicWalletFile(): string {
+  return (process.env.PUBLIC_WALLETS_FILE || "wallets.txt").trim() || "wallets.txt";
+}
+
+function readPublicWalletFile(file: string): string[] {
+  const lines = fs.readFileSync(file, "utf8").split(/\r?\n/);
+  const out: string[] = [];
+  const seen = new Set<string>();
+
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i].trim();
+    if (!raw || raw.startsWith("#")) continue;
+    const addr = normalizeAddress(raw);
+    if (!addr) throw new Error(`Invalid EVM address in ${file} at line ${i + 1}.`);
+    const k = addr.toLowerCase();
+    if (seen.has(k)) {
+      console.log(chalk.yellow(`  ⚠ Duplicate in ${file} line ${i + 1} skipped: ${addr}`));
+      continue;
+    }
+    seen.add(k);
+    out.push(addr);
+  }
+
+  if (!out.length) throw new Error(`${file} exists but contains no valid wallet addresses.`);
   return out;
 }
 
