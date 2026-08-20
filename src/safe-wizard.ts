@@ -7,6 +7,7 @@ import { buildLocalMintPlan } from "./seadrop-public";
 import { localPublicSnipe } from "./local-mint";
 import { askChoice, askHidden, askNumber, askText, askYesNo, closePrompts } from "./prompt";
 import { assertAggregateSupply, inspectWallets, validateMintTarget } from "./safety";
+import { loadWalletVault, walletVaultExists, walletVaultFile } from "./wallet-vault";
 
 const VN_OFFSET = 7 * 60 * 60 * 1000;
 
@@ -165,7 +166,20 @@ export async function runSafeWizard(): Promise<void> {
 
 async function promptKeys(): Promise<string[]> {
   if (!process.stdin.isTTY) throw new Error("SAFE mode refuses private keys from a pipe/redirect.");
+
+  if (!process.argv.includes("--no-vault") && walletVaultExists()) {
+    console.log(chalk.bold.white("Encrypted wallet vault"));
+    const loaded = loadWalletVault();
+    console.log(chalk.green(`  ✓ Loaded ${loaded.addresses.length} saved mint wallet(s) from ${loaded.file}.`));
+    loaded.addresses.forEach((address, i) => console.log(chalk.gray(`  [W${i}] ${address}`)));
+    console.log(chalk.gray("  Use npm start -- --no-vault to enter a different wallet set manually."));
+    return loaded.keys;
+  }
+
   console.log(chalk.bold.white("Private keys"));
+  if (!process.argv.includes("--no-vault")) {
+    console.log(chalk.gray(`  No encrypted vault found at ${walletVaultFile()}. Run npm run vault-setup to save wallets securely.`));
+  }
   console.log(chalk.gray("  Dedicated mint wallets only. One key per line; blank line when done."));
   const keys: string[] = [];
   const seen = new Set<string>();
