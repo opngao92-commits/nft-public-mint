@@ -16,12 +16,16 @@ NFT Public Mint SAFE v1
   Uses direct NFT contract input and fail-closed safety checks.
 
 Usage
-  npm start              real mint wizard
-  npm run dry-run        public-address-only preflight; no private key/sign/send
-  npm start -- --help    show this message
+  npm start                    real mint wizard; auto-load encrypted wallet vault when present
+  npm start -- --no-vault     ignore encrypted vault and enter keys manually
+  npm run dry-run              public-address-only preflight; no private key/sign/send
+  npm run vault-setup          create/replace Windows DPAPI encrypted wallet vault
+  npm run vault-status         show saved wallet addresses without decrypting keys
+  npm run vault-clear          delete encrypted wallet vault
+  npm start -- --help          show this message
 
 Optional defaults can be set in .env (see .env.example).
-Never store private keys or seed phrases in .env.
+Never store plaintext private keys or seed phrases in .env, wallets.txt, keys.txt, or shell history.
 `;
 
 async function main(): Promise<void> {
