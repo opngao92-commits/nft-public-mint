@@ -9,6 +9,10 @@ const SEADROP_SAFETY_ABI = [
   "function getCreatorPayoutAddress(address nftContract) view returns (address)",
 ];
 
+const DEFAULT_WALLET_RPC_CONCURRENCY = 2;
+const DEFAULT_WALLET_RPC_RETRIES = 6;
+const DEFAULT_WALLET_RPC_BACKOFF_MS = 350;
+
 export interface WalletMintState {
   address: string;
   minted: bigint;
@@ -65,15 +69,16 @@ export async function inspectWallets(
   const cap = BigInt(maxTotalMintableByWallet);
   const output: WalletMintState[] = [];
 
-  for (let offset = 0; offset < addresses.length; offset += 10) {
-    const batch = addresses.slice(offset, offset + 10);
+  const concurrency = readBoundedInt("WALLET_RPC_CONCURRENCY", DEFAULT_WALLET_RPC_CONCURRENCY, 1, 10);
+  const retries = readBoundedInt("WALLET_RPC_RETRIES", DEFAULT_WALLET_RPC_RETRIES, 1, 10);
+  const backoffMs = readBoundedInt("WALLET_RPC_BACKOFF_MS", DEFAULT_WALLET_RPC_BACKOFF_MS, 50, 5000);
+
+  // Public RPCs frequently throttle large wallet sets. Keep only a small number
+  // of eth_call requests in flight and retry each wallet with exponential backoff.
+  for (let offset = 0; offset < addresses.length; offset += concurrency) {
+    const batch = addresses.slice(offset, offset + concurrency);
     const rows = await Promise.all(batch.map(async (address): Promise<WalletMintState> => {
-      let raw: any;
-      try {
-        raw = await token.getMintStats(address);
-      } catch (err: any) {
-        throw new Error(`Could not read getMintStats(${address}): ${err?.shortMessage || err?.message || String(err)}`);
-      }
+      const raw = await getMintStatsWithRetry(token, address, retries, backoffMs);
       const minted = BigInt(raw.minterNumMinted ?? raw[0]);
       const currentSupply = BigInt(raw.currentTotalSupply ?? raw[1]);
       const maxSupply = BigInt(raw.maxSupply ?? raw[2]);
@@ -88,8 +93,44 @@ export async function inspectWallets(
       return { address, minted, currentSupply, maxSupply, walletRemaining, supplyRemaining, eligible: reasons.length === 0, reason: reasons.length ? reasons.join("; ") : undefined };
     }));
     output.push(...rows);
+
+    if (offset + concurrency < addresses.length) {
+      await sleep(75);
+    }
   }
   return output;
+}
+
+async function getMintStatsWithRetry(
+  token: Contract,
+  address: string,
+  maxAttempts: number,
+  baseBackoffMs: number
+): Promise<any> {
+  let lastError: any;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await token.getMintStats(address);
+    } catch (err: any) {
+      lastError = err;
+      if (attempt >= maxAttempts) break;
+      const delayMs = Math.min(baseBackoffMs * Math.pow(2, attempt - 1), 5000);
+      await sleep(delayMs);
+    }
+  }
+
+  const message = lastError?.shortMessage || lastError?.message || String(lastError);
+  throw new Error(`Could not read getMintStats(${address}) after ${maxAttempts} SAFE attempt(s): ${message}`);
+}
+
+function readBoundedInt(name: string, fallback: number, min: number, max: number): number {
+  const raw = Number(process.env[name] || fallback);
+  if (!Number.isFinite(raw)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(raw)));
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export function assertAggregateSupply(states: WalletMintState[], quantity: number, walletCount: number): void {
