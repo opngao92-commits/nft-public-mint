@@ -12,6 +12,7 @@
     "dry-run": "npm run build --silent && node dist/bootstrap.js --dry-run",
     "vault-setup": "npm run build --silent && node dist/vault-cli.js setup",
     "vault-status": "npm run build --silent && node dist/vault-cli.js status",
+    "vault-list": "npm run build --silent && node dist/vault-cli.js list",
     "vault-clear": "npm run build --silent && node dist/vault-cli.js clear",
     "dev": "ts-node src/index.ts"
   },
