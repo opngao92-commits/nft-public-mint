@@ -8,11 +8,11 @@
   },
   "scripts": {
     "build": "tsc",
-    "start": "node dist/bootstrap.js",
-    "dry-run": "node dist/bootstrap.js --dry-run",
-    "vault-setup": "node dist/vault-cli.js setup",
-    "vault-status": "node dist/vault-cli.js status",
-    "vault-clear": "node dist/vault-cli.js clear",
+    "start": "npm run build --silent && node dist/bootstrap.js",
+    "dry-run": "npm run build --silent && node dist/bootstrap.js --dry-run",
+    "vault-setup": "npm run build --silent && node dist/vault-cli.js setup",
+    "vault-status": "npm run build --silent && node dist/vault-cli.js status",
+    "vault-clear": "npm run build --silent && node dist/vault-cli.js clear",
     "dev": "ts-node src/index.ts"
   },
   "keywords": [
