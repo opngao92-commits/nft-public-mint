@@ -10,12 +10,16 @@ dotenv.config({ path: path.resolve(process.cwd(), ".env") });
 
 import { runSafeWizard } from "./safe-wizard";
 import { askChoice, askNumber, askText, closePrompts } from "./prompt";
-import { readWalletVaultAddresses, walletVaultExists } from "./wallet-vault";
+import {
+  activateWalletVault,
+  listWalletVaults,
+  WalletVaultSummary,
+} from "./vault-manager";
 
 async function main(): Promise<void> {
   let tempPublicWalletFile: string | null = null;
   try {
-    tempPublicWalletFile = await chooseVaultSubset();
+    tempPublicWalletFile = await chooseVaultAndSubset();
     await runSafeWizard();
     closePrompts();
   } catch (err: any) {
@@ -29,16 +33,22 @@ async function main(): Promise<void> {
   }
 }
 
-async function chooseVaultSubset(): Promise<string | null> {
-  if (process.argv.includes("--no-vault") || !walletVaultExists()) return null;
+async function chooseVaultAndSubset(): Promise<string | null> {
+  if (process.argv.includes("--no-vault")) return null;
 
-  const status = readWalletVaultAddresses();
-  const total = status.addresses.length;
-  if (!total) return null;
+  const vaults = listWalletVaults();
+  if (!vaults.length) return null;
+
   const dryRun = process.argv.includes("--dry-run");
+  const selectedVault = await chooseVault(vaults, dryRun);
+  activateWalletVault(selectedVault);
+
+  const total = selectedVault.addresses.length;
+  if (!total) throw new Error(`Selected vault ${selectedVault.file} contains no wallet addresses.`);
 
   console.log(chalk.bold.cyan(`\n${dryRun ? "Dry-run wallet selection" : "Mint wallet selection"}`));
-  console.log(chalk.gray(`  Encrypted vault: ${status.file}`));
+  console.log(chalk.gray(`  Encrypted vault: ${selectedVault.name}`));
+  console.log(chalk.gray(`  Vault file:      ${selectedVault.file}`));
   console.log(chalk.gray(`  Saved wallets:   ${total}`));
   console.log(chalk.gray("  Selection numbers below are 1-based: wallet 1 = SAFE W0."));
 
@@ -73,18 +83,41 @@ async function chooseVaultSubset(): Promise<string | null> {
   const preview = human.length <= 20
     ? human.join(",")
     : `${human.slice(0, 10).join(",")} ... ${human.slice(-5).join(",")}`;
-  console.log(chalk.bold.green(`\n  ✓ Selected ${indexes.length}/${total} wallet(s) for this ${dryRun ? "dry-run" : "mint"}.`));
+  console.log(chalk.bold.green(`\n  ✓ Selected ${indexes.length}/${total} wallet(s) from ${selectedVault.name}.`));
   console.log(chalk.gray(`  Vault wallet numbers: ${preview}`));
   console.log(chalk.gray("  The encrypted vault itself is unchanged.\n"));
 
   if (!dryRun) return null;
 
-  // Dry-run must inspect the exact same public-address subset without decrypting private keys.
-  const selectedAddresses = indexes.map((i) => status.addresses[i]);
+  // Dry-run inspects the exact selected public-address subset without decrypting private keys.
+  const selectedAddresses = indexes.map((i) => selectedVault.addresses[i]);
   const tempFile = path.join(os.tmpdir(), `nft-safe-wallets-${process.pid}.txt`);
   fs.writeFileSync(tempFile, `${selectedAddresses.join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
   process.env.PUBLIC_WALLETS_FILE = tempFile;
   return tempFile;
+}
+
+async function chooseVault(vaults: WalletVaultSummary[], dryRun: boolean): Promise<WalletVaultSummary> {
+  if (vaults.length === 1) {
+    const only = vaults[0];
+    console.log(chalk.bold.cyan(`\n${dryRun ? "Dry-run vault" : "Mint vault"}`));
+    console.log(chalk.green(`  ✓ ${only.name} — ${only.addresses.length} wallet(s)`));
+    return only;
+  }
+
+  const selectedFile = await askChoice<string>(
+    `Which wallet vault should this ${dryRun ? "dry-run" : "mint"} use?`,
+    vaults.map((vault) => ({
+      label: `${vault.name} — ${vault.addresses.length} wallet(s)`,
+      value: vault.file,
+      hint: vault.legacy ? "existing default vault" : vault.file,
+    })),
+    0
+  );
+
+  const selected = vaults.find((vault) => vault.file === selectedFile);
+  if (!selected) throw new Error("Selected wallet vault could not be resolved.");
+  return selected;
 }
 
 async function promptCustomSelection(total: number): Promise<number[]> {
