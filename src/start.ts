@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import fs from "fs";
+import os from "os";
 import path from "path";
 import dotenv from "dotenv";
 import chalk from "chalk";
@@ -11,54 +13,58 @@ import { askChoice, askNumber, askText, closePrompts } from "./prompt";
 import { readWalletVaultAddresses, walletVaultExists } from "./wallet-vault";
 
 async function main(): Promise<void> {
+  let tempPublicWalletFile: string | null = null;
   try {
-    await chooseVaultSubset();
+    tempPublicWalletFile = await chooseVaultSubset();
     await runSafeWizard();
     closePrompts();
-    process.exit(0);
   } catch (err: any) {
     closePrompts();
     console.error(chalk.red(`\n❌ ${err.message}\n`));
-    process.exit(1);
+    process.exitCode = 1;
+  } finally {
+    if (tempPublicWalletFile) {
+      try { fs.unlinkSync(tempPublicWalletFile); } catch { /* public-address temp file only */ }
+    }
   }
 }
 
-async function chooseVaultSubset(): Promise<void> {
-  if (process.argv.includes("--no-vault") || !walletVaultExists()) return;
+async function chooseVaultSubset(): Promise<string | null> {
+  if (process.argv.includes("--no-vault") || !walletVaultExists()) return null;
 
   const status = readWalletVaultAddresses();
   const total = status.addresses.length;
-  if (!total) return;
+  if (!total) return null;
+  const dryRun = process.argv.includes("--dry-run");
 
-  console.log(chalk.bold.cyan("\nMint wallet selection"));
+  console.log(chalk.bold.cyan(`\n${dryRun ? "Dry-run wallet selection" : "Mint wallet selection"}`));
   console.log(chalk.gray(`  Encrypted vault: ${status.file}`));
   console.log(chalk.gray(`  Saved wallets:   ${total}`));
   console.log(chalk.gray("  Selection numbers below are 1-based: wallet 1 = SAFE W0."));
 
-  if (total === 1) {
-    process.env.SAFE_WALLET_INDEXES = "0";
-    console.log(chalk.green("  ✓ Using the only wallet in the vault."));
-    return;
-  }
-
-  const mode = await askChoice<"all" | "first" | "custom">(
-    "Which saved wallets should this mint use?",
-    [
-      { label: `All ${total} wallets`, value: "all", hint: `1-${total}` },
-      { label: "First N wallets", value: "first", hint: "example: first 10" },
-      { label: "Custom wallet numbers / ranges", value: "custom", hint: "example: 1-5,21-25,40" },
-    ],
-    1
-  );
-
   let indexes: number[];
-  if (mode === "all") {
-    indexes = Array.from({ length: total }, (_, i) => i);
-  } else if (mode === "first") {
-    const count = Math.floor(await askNumber("How many wallets?", Math.min(10, total), { min: 1, max: total }));
-    indexes = Array.from({ length: count }, (_, i) => i);
+  if (total === 1) {
+    indexes = [0];
+    console.log(chalk.green("  ✓ Using the only wallet in the vault."));
   } else {
-    indexes = await promptCustomSelection(total);
+    const mode = await askChoice<"all" | "first" | "custom">(
+      `Which saved wallets should this ${dryRun ? "dry-run" : "mint"} use?`,
+      [
+        { label: `All ${total} wallets`, value: "all", hint: `1-${total}` },
+        { label: "First N wallets", value: "first", hint: "example: first 10" },
+        { label: "Custom wallet numbers / ranges", value: "custom", hint: "example: 1-5,21-25,40" },
+      ],
+      1
+    );
+
+    if (mode === "all") {
+      indexes = Array.from({ length: total }, (_, i) => i);
+    } else if (mode === "first") {
+      const count = Math.floor(await askNumber("How many wallets?", Math.min(10, total), { min: 1, max: total }));
+      indexes = Array.from({ length: count }, (_, i) => i);
+    } else {
+      indexes = await promptCustomSelection(total);
+    }
   }
 
   process.env.SAFE_WALLET_INDEXES = indexes.join(",");
@@ -67,9 +73,18 @@ async function chooseVaultSubset(): Promise<void> {
   const preview = human.length <= 20
     ? human.join(",")
     : `${human.slice(0, 10).join(",")} ... ${human.slice(-5).join(",")}`;
-  console.log(chalk.bold.green(`\n  ✓ Selected ${indexes.length}/${total} wallet(s) for this mint.`));
+  console.log(chalk.bold.green(`\n  ✓ Selected ${indexes.length}/${total} wallet(s) for this ${dryRun ? "dry-run" : "mint"}.`));
   console.log(chalk.gray(`  Vault wallet numbers: ${preview}`));
   console.log(chalk.gray("  The encrypted vault itself is unchanged.\n"));
+
+  if (!dryRun) return null;
+
+  // Dry-run must inspect the exact same public-address subset without decrypting private keys.
+  const selectedAddresses = indexes.map((i) => status.addresses[i]);
+  const tempFile = path.join(os.tmpdir(), `nft-safe-wallets-${process.pid}.txt`);
+  fs.writeFileSync(tempFile, `${selectedAddresses.join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
+  process.env.PUBLIC_WALLETS_FILE = tempFile;
+  return tempFile;
 }
 
 async function promptCustomSelection(total: number): Promise<number[]> {
