@@ -11,6 +11,7 @@ dist/
 wallets.txt
 wallets.secure
 *.secure
+vaults/
 
 # Private keys — never commit
 wallets/
