@@ -62,18 +62,16 @@ function acquire(): Promise<void> {
     active++;
     return Promise.resolve();
   }
-  return new Promise((resolve) => {
-    queue.push(() => {
-      active++;
-      resolve();
-    });
-  });
+  return new Promise((resolve) => queue.push(resolve));
 }
 
 function release(): void {
   active = Math.max(0, active - 1);
   const next = queue.shift();
-  if (next) setTimeout(next, 75);
+  if (next) {
+    active++;
+    setTimeout(next, 75);
+  }
 }
 
 function readBoundedInt(name: string, fallback: number, min: number, max: number): number {
