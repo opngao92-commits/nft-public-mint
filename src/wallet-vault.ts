@@ -92,7 +92,17 @@ export function loadWalletVault(): LoadedWalletVault {
     throw new Error("Wallet vault integrity check failed: encrypted keys do not match stored public addresses.");
   }
 
-  return { keys, addresses, file };
+  const selectedIndexes = readSelectedWalletIndexes(addresses.length);
+  if (selectedIndexes === null) return { keys, addresses, file };
+
+  const selectedKeys = selectedIndexes.map((i) => keys[i]);
+  const selectedAddresses = selectedIndexes.map((i) => addresses[i]);
+
+  // Drop references to unselected decrypted key strings before entering the mint wizard.
+  keys.fill("");
+  payload.keys.fill("");
+
+  return { keys: selectedKeys, addresses: selectedAddresses, file };
 }
 
 export function readWalletVaultAddresses(): { addresses: string[]; file: string; createdAt: string | null } {
@@ -117,6 +127,28 @@ export function deleteWalletVault(): boolean {
 export function savePublicWalletList(addresses: string[]): void {
   const file = publicWalletListFile();
   fs.writeFileSync(file, `${addresses.join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
+}
+
+function readSelectedWalletIndexes(total: number): number[] | null {
+  const raw = (process.env.SAFE_WALLET_INDEXES || "").trim();
+  if (!raw) return null;
+
+  const out: number[] = [];
+  const seen = new Set<number>();
+  for (const token of raw.split(",")) {
+    const part = token.trim();
+    if (!/^\d+$/.test(part)) throw new Error("Internal wallet selection is invalid.");
+    const index = Number(part);
+    if (!Number.isSafeInteger(index) || index < 0 || index >= total) {
+      throw new Error(`Selected wallet index ${index} is outside the vault range.`);
+    }
+    if (seen.has(index)) continue;
+    seen.add(index);
+    out.push(index);
+  }
+
+  if (!out.length) throw new Error("Internal wallet selection is empty.");
+  return out;
 }
 
 function normalizeAndValidateKeys(rawKeys: string[]): string[] {
