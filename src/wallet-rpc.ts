@@ -4,75 +4,76 @@ const DEFAULT_CONCURRENCY = 2;
 const DEFAULT_RETRIES = 6;
 const DEFAULT_BACKOFF_MS = 350;
 
-export async function readWalletBalances(
-  provider: JsonRpcProvider,
-  addresses: string[]
-): Promise<bigint[]> {
-  return readWalletValues(
-    addresses,
-    async (address) => provider.getBalance(address),
-    "getBalance"
-  );
+let installed = false;
+let active = 0;
+const queue: Array<() => void> = [];
+
+export function installWalletRpcGuard(): void {
+  if (installed) return;
+  installed = true;
+
+  const proto = JsonRpcProvider.prototype as any;
+  const originalGetBalance = proto.getBalance;
+  const originalGetTransactionCount = proto.getTransactionCount;
+
+  proto.getBalance = function(address: string, blockTag?: any): Promise<bigint> {
+    return guardedCall(
+      () => originalGetBalance.call(this, address, blockTag),
+      `getBalance(${address})`
+    );
+  };
+
+  proto.getTransactionCount = function(address: string, blockTag?: any): Promise<number> {
+    return guardedCall(
+      () => originalGetTransactionCount.call(this, address, blockTag),
+      `getTransactionCount(${address},${blockTag ?? "latest"})`
+    );
+  };
 }
 
-export async function readPendingNonces(
-  provider: JsonRpcProvider,
-  addresses: string[]
-): Promise<number[]> {
-  return readWalletValues(
-    addresses,
-    async (address) => provider.getTransactionCount(address, "pending"),
-    "getTransactionCount(pending)"
-  );
-}
+async function guardedCall<T>(fn: () => Promise<T>, label: string): Promise<T> {
+  await acquire();
+  try {
+    const retries = readBoundedInt("WALLET_RPC_RETRIES", DEFAULT_RETRIES, 1, 10);
+    const backoffMs = readBoundedInt("WALLET_RPC_BACKOFF_MS", DEFAULT_BACKOFF_MS, 50, 5000);
+    let lastError: any;
 
-async function readWalletValues<T>(
-  addresses: string[],
-  reader: (address: string) => Promise<T>,
-  label: string
-): Promise<T[]> {
-  const concurrency = readBoundedInt("WALLET_RPC_CONCURRENCY", DEFAULT_CONCURRENCY, 1, 10);
-  const retries = readBoundedInt("WALLET_RPC_RETRIES", DEFAULT_RETRIES, 1, 10);
-  const backoffMs = readBoundedInt("WALLET_RPC_BACKOFF_MS", DEFAULT_BACKOFF_MS, 50, 5000);
-  const output: T[] = [];
-
-  for (let offset = 0; offset < addresses.length; offset += concurrency) {
-    const batch = addresses.slice(offset, offset + concurrency);
-    const rows = await Promise.all(batch.map((address) => readWithRetry(
-      () => reader(address),
-      `${label}(${address})`,
-      retries,
-      backoffMs
-    )));
-    output.push(...rows);
-
-    if (offset + concurrency < addresses.length) await sleep(75);
-  }
-
-  return output;
-}
-
-async function readWithRetry<T>(
-  fn: () => Promise<T>,
-  label: string,
-  maxAttempts: number,
-  baseBackoffMs: number
-): Promise<T> {
-  let lastError: any;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      return await fn();
-    } catch (err: any) {
-      lastError = err;
-      if (attempt >= maxAttempts) break;
-      const delayMs = Math.min(baseBackoffMs * Math.pow(2, attempt - 1), 5000);
-      await sleep(delayMs);
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        return await fn();
+      } catch (err: any) {
+        lastError = err;
+        if (attempt >= retries) break;
+        const delayMs = Math.min(backoffMs * Math.pow(2, attempt - 1), 5000);
+        await sleep(delayMs);
+      }
     }
-  }
 
-  const message = lastError?.shortMessage || lastError?.message || String(lastError);
-  throw new Error(`Could not read ${label} after ${maxAttempts} SAFE attempt(s): ${message}`);
+    const message = lastError?.shortMessage || lastError?.message || String(lastError);
+    throw new Error(`Could not read ${label} after ${retries} SAFE attempt(s): ${message}`);
+  } finally {
+    release();
+  }
+}
+
+function acquire(): Promise<void> {
+  const concurrency = readBoundedInt("WALLET_RPC_CONCURRENCY", DEFAULT_CONCURRENCY, 1, 10);
+  if (active < concurrency) {
+    active++;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    queue.push(() => {
+      active++;
+      resolve();
+    });
+  });
+}
+
+function release(): void {
+  active = Math.max(0, active - 1);
+  const next = queue.shift();
+  if (next) setTimeout(next, 75);
 }
 
 function readBoundedInt(name: string, fallback: number, min: number, max: number): number {
