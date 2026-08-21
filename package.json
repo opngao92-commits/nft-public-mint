@@ -8,8 +8,8 @@
   },
   "scripts": {
     "build": "tsc",
-    "start": "node dist/start.js",
-    "dry-run": "node dist/start.js --dry-run",
+    "start": "node dist/bootstrap.js",
+    "dry-run": "node dist/bootstrap.js --dry-run",
     "vault-setup": "node dist/vault-cli.js setup",
     "vault-status": "node dist/vault-cli.js status",
     "vault-clear": "node dist/vault-cli.js clear",
