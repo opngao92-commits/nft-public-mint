@@ -28,11 +28,21 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<void> {
 
   const provider = new JsonRpcProvider(rpcUrls[0]);
   const endpoints = parseRpcEndpoints(rpcUrls);
-  const configuredLead = Number(process.env.PREPARE_LEAD_MS || "30000");
-  const dynamicLead = 5_000 + walletKeys.length * 150;
-  const prepareLeadMs = Number.isFinite(configuredLead)
-    ? Math.max(5_000, Math.floor(configuredLead), dynamicLead)
-    : Math.max(30_000, dynamicLead);
+  const walletCount = walletKeys.length;
+
+  // Large wallet sets need time for throttled/retried RPC reads. Do the expensive
+  // safety work early, then keep the T-0 critical path limited to a fresh config
+  // read, fee check, pending nonces, signing, and broadcast.
+  const configuredHeavyLead = Number(process.env.PREPARE_LEAD_MS || "0");
+  const configuredSignLead = Number(process.env.SIGN_LEAD_MS || "0");
+  const dynamicSignLead = Math.max(15_000, Math.min(45_000, 10_000 + walletCount * 250));
+  const signLeadMs = Number.isFinite(configuredSignLead) && configuredSignLead > 0
+    ? Math.max(dynamicSignLead, Math.floor(configuredSignLead))
+    : dynamicSignLead;
+  const dynamicHeavyLead = Math.max(45_000, 45_000 + walletCount * 1_000, signLeadMs + 30_000);
+  const prepareLeadMs = Number.isFinite(configuredHeavyLead) && configuredHeavyLead > 0
+    ? Math.max(dynamicHeavyLead, Math.floor(configuredHeavyLead))
+    : dynamicHeavyLead;
 
   console.log(chalk.bold.magenta("\n── SAFE LOCAL PUBLIC MINT ──"));
   console.log(chalk.gray(`  NFT:           ${nftContract}`));
@@ -41,30 +51,27 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<void> {
   console.log(chalk.gray(`  Price:         ${formatEther(plan.drop.mintPrice)} × ${quantity} = ${formatEther(plan.value)} per wallet`));
 
   if (targetStart) {
-    const prepareAt = targetStart.getTime() - prepareLeadMs;
-    const delay = prepareAt - Date.now();
-    if (delay > 0) {
-      console.log(chalk.gray(`  SAFE final preflight starts about T-${Math.round(prepareLeadMs / 1000)}s.`));
-      await new Promise((resolve) => setTimeout(resolve, delay));
-    }
+    console.log(chalk.gray(`  Heavy safety preflight: about T-${Math.round(prepareLeadMs / 1000)}s.`));
+    console.log(chalk.gray(`  Critical nonce/sign window: about T-${Math.round(signLeadMs / 1000)}s.`));
+    await waitUntil(targetStart.getTime() - prepareLeadMs);
   }
 
   const wallets = walletKeys.map((key) => new Wallet(key, provider));
   walletKeys.fill("");
 
-  console.log(chalk.bold.white("\n  SAFE final preflight..."));
-  const freshPlan = await buildLocalMintPlan(rpcUrls[0], nftContract, quantity);
-  if (!freshPlan) throw new Error("Public SeaDrop config is no longer readable.");
+  console.log(chalk.bold.white("\n  SAFE heavy preflight..."));
+  const heavyPlan = await buildLocalMintPlan(rpcUrls[0], nftContract, quantity);
+  if (!heavyPlan) throw new Error("Public SeaDrop config is no longer readable.");
 
-  const changes = diffMintPlans(plan, freshPlan);
-  if (changes.length > 0) {
+  const heavyChanges = diffMintPlans(plan, heavyPlan);
+  if (heavyChanges.length > 0) {
     console.log(chalk.bold.red("  Mint configuration changed after confirmation:"));
-    for (const change of changes) console.log(chalk.red(`    - ${change}`));
+    for (const change of heavyChanges) console.log(chalk.red(`    - ${change}`));
     throw new Error("SAFE mode refuses to sign a stale mint plan.");
   }
 
-  await validateMintTarget(provider, nftContract, freshPlan);
-  if (Math.floor(Date.now() / 1000) > freshPlan.drop.endTime) {
+  await validateMintTarget(provider, nftContract, heavyPlan);
+  if (Math.floor(Date.now() / 1000) > heavyPlan.drop.endTime) {
     throw new Error("Public stage ended before final signing.");
   }
 
@@ -73,7 +80,7 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<void> {
     nftContract,
     wallets.map((w) => w.address),
     quantity,
-    freshPlan.drop.maxTotalMintableByWallet
+    heavyPlan.drop.maxTotalMintableByWallet
   );
   const blocked = states.filter((s) => !s.eligible);
   if (blocked.length) {
@@ -83,32 +90,52 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<void> {
   assertAggregateSupply(states, quantity, wallets.length);
 
   const effectiveGasLimit = gasLimit || 250_000;
-  const required = BigInt(effectiveGasLimit) * maxFeePerGas + freshPlan.value;
+  const required = BigInt(effectiveGasLimit) * maxFeePerGas + heavyPlan.value;
   const balances = await Promise.all(wallets.map((w) => provider.getBalance(w.address)));
   if (balances.some((b) => b < required)) {
     throw new Error("At least one wallet became underfunded before final signing.");
   }
 
-  const latest = await provider.getBlock("latest");
-  if (latest?.baseFeePerGas !== null && latest?.baseFeePerGas !== undefined && maxFeePerGas < latest.baseFeePerGas) {
-    throw new Error(`Selected max fee is below latest base fee (${latest.baseFeePerGas} wei).`);
+  await assertFeeCeiling(provider, maxFeePerGas);
+  await warmConnections(rpcUrls);
+  console.log(chalk.green(`  ✓ Heavy preflight PASS for ${wallets.length} wallet(s).`));
+
+  if (targetStart) {
+    await waitUntil(targetStart.getTime() - signLeadMs);
   }
 
-  await warmConnections(rpcUrls);
+  console.log(chalk.bold.white("\n  SAFE critical preflight..."));
+  const criticalPlan = await buildLocalMintPlan(rpcUrls[0], nftContract, quantity);
+  if (!criticalPlan) throw new Error("Public SeaDrop config became unreadable in the critical window.");
+
+  const criticalChanges = diffMintPlans(heavyPlan, criticalPlan);
+  if (criticalChanges.length > 0) {
+    console.log(chalk.bold.red("  Mint configuration changed during final wait:"));
+    for (const change of criticalChanges) console.log(chalk.red(`    - ${change}`));
+    throw new Error("SAFE mode refuses to sign after a mint-plan change.");
+  }
+
+  await validateMintTarget(provider, nftContract, criticalPlan);
+  if (Math.floor(Date.now() / 1000) > criticalPlan.drop.endTime) {
+    throw new Error("Public stage ended before critical signing.");
+  }
+  await assertFeeCeiling(provider, maxFeePerGas);
+
+  const nonceStart = performance.now();
   const [nonces, network] = await Promise.all([
     Promise.all(wallets.map((w) => provider.getTransactionCount(w.address, "pending"))),
     provider.getNetwork(),
   ]);
   const chainId = network.chainId;
-  console.log(chalk.gray(`  Nonces: [${nonces.join(", ")}] | chainId: ${chainId}`));
+  console.log(chalk.gray(`  ✓ Pending nonces read in ${(performance.now() - nonceStart).toFixed(1)}ms | chainId: ${chainId}`));
 
   const signStart = performance.now();
   const prepared: { idx: number; address: string; blast: PreparedBlast }[] = [];
   for (let i = 0; i < wallets.length; i++) {
     const rawTx = await wallets[i].signTransaction({
-      to: freshPlan.to,
-      data: freshPlan.data,
-      value: freshPlan.value,
+      to: criticalPlan.to,
+      data: criticalPlan.data,
+      value: criticalPlan.value,
       nonce: nonces[i],
       maxFeePerGas,
       maxPriorityFeePerGas: maxPriorityFee,
@@ -120,6 +147,12 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<void> {
   }
   console.log(chalk.green(`  ✓ ${prepared.length} tx(s) signed in ${(performance.now() - signStart).toFixed(1)}ms.`));
 
+  // Refresh TCP/TLS shortly before T-0 when there is enough headroom. Skip this
+  // if we are already too close so connection warming can never delay dispatch.
+  if (!targetStart || targetStart.getTime() - Date.now() > 3_000) {
+    await warmConnections(rpcUrls);
+  }
+
   if (targetStart) await waitForMintTime(targetStart, 0);
   else console.log(chalk.bold.yellow("\n  🚀 Firing immediately..."));
 
@@ -130,7 +163,8 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<void> {
     return { idx, address, txHash, responsePromise };
   });
 
-  console.log(chalk.bold.green(`  DISPATCHED ${fired.length} tx(s) (${(performance.now() - dispatchStart).toFixed(2)}ms, +${Math.max(0, Date.now() - stageStartMs)}ms after stage)`));
+  const latenessMs = Math.max(0, Date.now() - stageStartMs);
+  console.log(chalk.bold.green(`  DISPATCHED ${fired.length} tx(s) (${(performance.now() - dispatchStart).toFixed(2)}ms, +${latenessMs}ms after stage)`));
   for (const f of fired) console.log(chalk.gray(`    [W${f.idx}] ${f.txHash}`));
 
   const settled = await Promise.all(fired.map(async (f) => ({ ...f, results: await f.responsePromise })));
@@ -163,4 +197,16 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<void> {
   }));
 
   console.log(chalk.bold.white("\n===== SAFE LOCAL PUBLIC MINT COMPLETE ====="));
+}
+
+async function assertFeeCeiling(provider: JsonRpcProvider, maxFeePerGas: bigint): Promise<void> {
+  const latest = await provider.getBlock("latest");
+  if (latest?.baseFeePerGas !== null && latest?.baseFeePerGas !== undefined && maxFeePerGas < latest.baseFeePerGas) {
+    throw new Error(`Selected max fee is below latest base fee (${latest.baseFeePerGas} wei).`);
+  }
+}
+
+async function waitUntil(epochMs: number): Promise<void> {
+  const delay = epochMs - Date.now();
+  if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
 }
